@@ -7,7 +7,8 @@ import mongoose from "mongoose";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { webcrypto } from "node:crypto";
+import rateLimit from "express-rate-limit";
+import { timingSafeEqual, webcrypto } from "node:crypto";
 import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
 import apiLogger from "./utils/logger.js";
@@ -25,6 +26,15 @@ dotenv.config({ path: path.join(__dirname, ".env"), quiet: true });
 
 const PORT = process.env.PORT || 4000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:3000";
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || CLIENT_ORIGIN)
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || "")
+  .split(",")
+  .map((host) => host.trim().toLowerCase())
+  .filter(Boolean);
+const API_KEY = process.env.API_KEY || "";
 const JWT_SECRET = process.env.JWT_SECRET || "change_this_secret_in_env";
 const MONGODB_URI =
   process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/resume_parser";
@@ -173,9 +183,112 @@ const User = mongoose.model("User", userSchema);
 const Resume = mongoose.model("Resume", resumeSchema);
 
 const app = express();
+
+if (process.env.NODE_ENV === "production" && JWT_SECRET === "change_this_secret_in_env") {
+  throw new Error("JWT_SECRET must be configured in production.");
+}
+
+function allowedOrigin(origin) {
+  return ALLOWED_ORIGINS.includes(origin);
+}
+
+function allowedHost(host = "") {
+  if (ALLOWED_HOSTS.length === 0) {
+    return true;
+  }
+
+  const hostname = host.split(":")[0].toLowerCase();
+  return ALLOWED_HOSTS.includes(hostname);
+}
+
+function safeCompare(value, expected) {
+  const valueBuffer = Buffer.from(String(value || ""));
+  const expectedBuffer = Buffer.from(String(expected || ""));
+
+  if (valueBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+
+  return timingSafeEqual(valueBuffer, expectedBuffer);
+}
+
 app.use(apiLogger);
-app.use(cors({ origin: CLIENT_ORIGIN, credentials: true }));
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("X-Frame-Options", "DENY");
+  next();
+});
+app.use(
+  cors({
+    credentials: true,
+    origin(origin, callback) {
+      if (!origin || allowedOrigin(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error("Origin is not allowed by CORS."));
+    },
+  })
+);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (!allowedHost(req.headers.host)) {
+    return res.status(403).json({ error: "Host is not allowed." });
+  }
+
+  if (origin && !allowedOrigin(origin)) {
+    return res.status(403).json({ error: "Origin is not allowed." });
+  }
+
+  next();
+});
 app.use(express.json({ limit: "2mb" }));
+
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.RATE_LIMIT_MAX || 300),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Please try again later." },
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.AUTH_RATE_LIMIT_MAX || 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many auth attempts. Please try again later." },
+});
+
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.UPLOAD_RATE_LIMIT_MAX || 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many uploads. Please try again later." },
+});
+
+function requireApiKey(req, res, next) {
+  if (!API_KEY) {
+    next();
+    return;
+  }
+
+  const providedKey = req.headers["x-api-key"];
+
+  if (!safeCompare(providedKey, API_KEY)) {
+    return res.status(401).json({ error: "Valid API key is required." });
+  }
+
+  next();
+}
+
+app.use("/api", generalLimiter, requireApiKey);
 
 function cleanGeminiJson(rawText) {
   return rawText
@@ -285,7 +398,7 @@ app.get("/api/health", (req, res) => {
   res.json({ ok: true, service: "resume-parser", model: GEMINI_MODEL });
 });
 
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", authLimiter, async (req, res) => {
   const { name, email, password } = req.body;
   const normalizedEmail = String(email || "").trim().toLowerCase();
 
@@ -308,7 +421,7 @@ app.post("/api/auth/register", async (req, res) => {
   res.status(201).json({ token: signToken(user), user: publicUser(user) });
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   const { email, password } = req.body;
   const normalizedEmail = String(email || "").trim().toLowerCase();
 
@@ -396,7 +509,7 @@ app.delete("/api/resumes/:id", requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/api/resumes/parse", requireAuth, upload.single("resume"), async (req, res) => {
+app.post("/api/resumes/parse", uploadLimiter, requireAuth, upload.single("resume"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "Please choose a PDF resume before submitting." });
   }
@@ -441,6 +554,10 @@ app.post("/api/resumes/parse", requireAuth, upload.single("resume"), async (req,
 });
 
 app.use((error, req, res, next) => {
+  if (error.message === "Origin is not allowed by CORS.") {
+    return res.status(403).json({ error: "Origin is not allowed." });
+  }
+
   if (error instanceof multer.MulterError || error.message?.includes("PDF")) {
     return res.status(400).json({ error: error.message });
   }
