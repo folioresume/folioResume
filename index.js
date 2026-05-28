@@ -8,6 +8,7 @@ import cors from "cors";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
+import { v2 as cloudinary } from "cloudinary";
 import { timingSafeEqual, webcrypto } from "node:crypto";
 import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
@@ -39,6 +40,15 @@ const JWT_SECRET = process.env.JWT_SECRET || "change_this_secret_in_env";
 const MONGODB_URI =
   process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/resume_parser";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const CLOUDINARY_PROJECT_NAME =
+  process.env.CLOUDINARY_PROJECT_NAME || process.env.PROJECT_NAME || "resumeai";
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+  secure: true,
+});
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
@@ -144,6 +154,18 @@ const upload = multer({
   },
 });
 
+const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith("image/")) {
+      return cb(new Error("Only image files are supported."));
+    }
+
+    cb(null, true);
+  },
+});
+
 const userSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
@@ -155,6 +177,7 @@ const userSchema = new mongoose.Schema(
       company: { type: String, default: "" },
       location: { type: String, default: "" },
       linkedin: { type: String, default: "" },
+      imageUrl: { type: String, default: "" },
       summary: { type: String, default: "" },
       competencies: { type: [String], default: [] },
     },
@@ -273,7 +296,20 @@ const uploadLimiter = rateLimit({
   message: { error: "Too many uploads. Please try again later." },
 });
 
+const imageUploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.IMAGE_UPLOAD_RATE_LIMIT_MAX || 30),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many image uploads. Please try again later." },
+});
+
 function requireApiKey(req, res, next) {
+  if (req.path.startsWith("/portfolio/")) {
+    next();
+    return;
+  }
+
   if (!API_KEY) {
     next();
     return;
@@ -324,6 +360,44 @@ function publicResume(resume) {
   };
 }
 
+function publicPortfolioData(user, resume) {
+  const parsedData = resume?.parsedData && typeof resume.parsedData === "object"
+    ? resume.parsedData
+    : {};
+  const personalInfo = {
+    ...(parsedData.personalInfo || {}),
+    name: parsedData.personalInfo?.name || user.name,
+    email: parsedData.personalInfo?.email || user.email,
+    title: parsedData.personalInfo?.title || user.profile?.title || null,
+    phone: parsedData.personalInfo?.phone?.length
+      ? parsedData.personalInfo.phone
+      : user.profile?.phone
+        ? [user.profile.phone]
+        : [],
+    location: parsedData.personalInfo?.location || user.profile?.location || null,
+    linkedin: parsedData.personalInfo?.linkedin || user.profile?.linkedin || null,
+    imgUrl:
+      parsedData.personalInfo?.imgUrl ||
+      user.profile?.imageUrl ||
+      null,
+  };
+
+  return {
+    personalInfo,
+    summary: parsedData.summary || user.profile?.summary || null,
+    skills: parsedData.skills || [
+      {
+        skill_category_name: "Competencies",
+        skills_belongs_this_category: user.profile?.competencies || [],
+      },
+    ],
+    experience: parsedData.experience || [],
+    education: parsedData.education || [],
+    projects: parsedData.projects || [],
+    certificates: parsedData.certificates || [],
+  };
+}
+
 function signToken(user) {
   return jwt.sign({ sub: user._id.toString() }, JWT_SECRET, { expiresIn: "7d" });
 }
@@ -348,6 +422,47 @@ async function requireAuth(req, res, next) {
   } catch {
     res.status(401).json({ error: "Invalid or expired session." });
   }
+}
+
+function sanitizeCloudinarySegment(value, fallback) {
+  const sanitized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9-_]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+
+  return sanitized || fallback;
+}
+
+function cloudinaryReady() {
+  return Boolean(
+    process.env.CLOUDINARY_CLOUD_NAME &&
+      process.env.CLOUDINARY_API_KEY &&
+      process.env.CLOUDINARY_API_SECRET,
+  );
+}
+
+function uploadBufferToCloudinary(file, folder) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder,
+        resource_type: "image",
+        overwrite: false,
+      },
+      (error, result) => {
+        if (error || !result) {
+          reject(error || new Error("Cloudinary upload failed."));
+          return;
+        }
+
+        resolve(result);
+      },
+    );
+
+    stream.end(file.buffer);
+  });
 }
 
 function getUploadErrorMessage(error) {
@@ -451,6 +566,38 @@ app.get("/api/profile", requireAuth, (req, res) => {
   res.json({ user: publicUser(req.user) });
 });
 
+app.get("/api/portfolio/:resumeId", async (req, res) => {
+  if (!mongoose.Types.ObjectId.isValid(req.params.resumeId)) {
+    return res.status(400).json({ error: "Invalid resume id." });
+  }
+
+  const resume = await Resume.findOne({
+    _id: req.params.resumeId,
+    parseStatus: "completed",
+    parsedData: { $ne: null },
+  }).lean();
+
+  if (!resume) {
+    return res.status(404).json({ error: "Portfolio resume not found." });
+  }
+
+  const user = resume.user ? await User.findById(resume.user).lean() : null;
+
+  res.json({
+    user: user ? publicUser(user) : null,
+    resume: publicResume(resume),
+    data: publicPortfolioData(
+      user || {
+        _id: null,
+        name: "",
+        email: "",
+        profile: {},
+      },
+      resume,
+    ),
+  });
+});
+
 app.put("/api/profile", requireAuth, async (req, res) => {
   const { name, profile = {} } = req.body;
 
@@ -469,6 +616,53 @@ app.put("/api/profile", requireAuth, async (req, res) => {
 
   res.json({ user: publicUser(req.user) });
 });
+
+app.post(
+  "/api/uploads/image",
+  imageUploadLimiter,
+  requireAuth,
+  imageUpload.single("image"),
+  async (req, res) => {
+    if (!cloudinaryReady()) {
+      return res.status(500).json({ error: "Cloudinary is not configured." });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: "Please choose an image to upload." });
+    }
+
+    const allowedCategories = new Set([
+      "profile",
+      "certificate",
+      "project",
+      "education",
+      "experience",
+      "resume",
+    ]);
+    const category = sanitizeCloudinarySegment(req.body.category, "resume");
+    const projectName = sanitizeCloudinarySegment(
+      req.body.projectName || CLOUDINARY_PROJECT_NAME,
+      "resumeai",
+    );
+
+    if (!allowedCategories.has(category)) {
+      return res.status(400).json({ error: "Unsupported image category." });
+    }
+
+    const folder = `${projectName}/${category}`;
+    const result = await uploadBufferToCloudinary(req.file, folder);
+
+    res.status(201).json({
+      url: result.secure_url,
+      publicId: result.public_id,
+      folder,
+      category,
+      width: result.width,
+      height: result.height,
+      format: result.format,
+    });
+  },
+);
 
 app.get("/api/resumes", requireAuth, async (req, res) => {
   const resumes = await Resume.find({ user: req.user._id }).sort({ createdAt: -1 }).lean();
@@ -558,7 +752,11 @@ app.use((error, req, res, next) => {
     return res.status(403).json({ error: "Origin is not allowed." });
   }
 
-  if (error instanceof multer.MulterError || error.message?.includes("PDF")) {
+  if (
+    error instanceof multer.MulterError ||
+    error.message?.includes("PDF") ||
+    error.message?.includes("image")
+  ) {
     return res.status(400).json({ error: error.message });
   }
 
