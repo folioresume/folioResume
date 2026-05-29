@@ -9,7 +9,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import rateLimit from "express-rate-limit";
 import { v2 as cloudinary } from "cloudinary";
-import { timingSafeEqual, webcrypto } from "node:crypto";
+import { createHash, timingSafeEqual, webcrypto } from "node:crypto";
 import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
 import apiLogger from "./utils/logger.js";
@@ -42,6 +42,7 @@ const MONGODB_URI =
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const CLOUDINARY_PROJECT_NAME =
   process.env.CLOUDINARY_PROJECT_NAME || process.env.PROJECT_NAME || "resumeai";
+const PORTFOLIO_BASE_URL = process.env.PORTFOLIO_BASE_URL || "http://localhost:3001";
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -198,6 +199,34 @@ const resumeSchema = new mongoose.Schema(
     },
     parseError: { type: String, default: null },
     parsedData: { type: mongoose.Schema.Types.Mixed, default: null },
+    portfolioTotalCount: { type: Number, default: 0 },
+    portfolioUniqueCount: { type: Number, default: 0 },
+    portfolioVisitorKeys: { type: [String], default: [] },
+    portfolioLastVisit: {
+      city: { type: String, default: "" },
+      region: { type: String, default: "" },
+      country: { type: String, default: "" },
+      timezone: { type: String, default: "" },
+      ipHash: { type: String, default: "" },
+      userAgent: { type: String, default: "" },
+      referrer: { type: String, default: "" },
+      visitedAt: { type: Date, default: null },
+    },
+    portfolioVisits: {
+      type: [
+        {
+          city: { type: String, default: "" },
+          region: { type: String, default: "" },
+          country: { type: String, default: "" },
+          timezone: { type: String, default: "" },
+          ipHash: { type: String, default: "" },
+          userAgent: { type: String, default: "" },
+          referrer: { type: String, default: "" },
+          visitedAt: { type: Date, default: Date.now },
+        },
+      ],
+      default: [],
+    },
   },
   { timestamps: true }
 );
@@ -345,9 +374,25 @@ function publicUser(user) {
   };
 }
 
-function publicResume(resume) {
+function publicVisit(visit = {}) {
   return {
-    id: resume._id.toString(),
+    city: visit.city || "",
+    region: visit.region || "",
+    country: visit.country || "",
+    timezone: visit.timezone || "",
+    userAgent: visit.userAgent || "",
+    referrer: visit.referrer || "",
+    visitedAt: visit.visitedAt || null,
+  };
+}
+
+function publicResume(resume) {
+  const id = resume._id.toString();
+  const portfolioUrl = new URL(PORTFOLIO_BASE_URL);
+  portfolioUrl.searchParams.set("resumeId", id);
+
+  return {
+    id,
     user: resume.user?.toString?.() || null,
     originalFileName: resume.originalFileName,
     fileSize: resume.fileSize,
@@ -355,6 +400,15 @@ function publicResume(resume) {
     parseStatus: resume.parseStatus,
     parseError: resume.parseError,
     parsedData: resume.parsedData,
+    portfolioTotalCount: resume.portfolioTotalCount || 0,
+    portfolioUniqueCount: resume.portfolioUniqueCount || 0,
+    portfolioUrl: portfolioUrl.toString(),
+    portfolioLastVisit: resume.portfolioLastVisit
+      ? publicVisit(resume.portfolioLastVisit)
+      : null,
+    portfolioVisits: Array.isArray(resume.portfolioVisits)
+      ? resume.portfolioVisits.map(publicVisit).reverse()
+      : [],
     createdAt: resume.createdAt,
     updatedAt: resume.updatedAt,
   };
@@ -465,6 +519,104 @@ function uploadBufferToCloudinary(file, folder) {
   });
 }
 
+function firstHeaderValue(value) {
+  if (Array.isArray(value)) {
+    return value[0] || "";
+  }
+
+  return String(value || "");
+}
+
+function decodeHeaderValue(value) {
+  try {
+    return decodeURIComponent(firstHeaderValue(value));
+  } catch {
+    return firstHeaderValue(value);
+  }
+}
+
+function requestIp(req) {
+  const forwardedFor = firstHeaderValue(req.headers["x-forwarded-for"]);
+  const ip = (
+    forwardedFor.split(",")[0]?.trim() ||
+    firstHeaderValue(req.headers["cf-connecting-ip"]) ||
+    firstHeaderValue(req.headers["x-real-ip"]) ||
+    req.ip ||
+    req.socket?.remoteAddress ||
+    "unknown"
+  );
+
+  return ip.replace(/^::ffff:/, "");
+}
+
+function visitorInfoFromRequest(req) {
+  const ip = requestIp(req);
+
+  return {
+    city:
+      decodeHeaderValue(req.headers["x-vercel-ip-city"]) ||
+      decodeHeaderValue(req.headers["cf-ipcity"]) ||
+      decodeHeaderValue(req.headers["x-app-city"]),
+    region:
+      decodeHeaderValue(req.headers["x-vercel-ip-country-region"]) ||
+      decodeHeaderValue(req.headers["cf-region"]) ||
+      decodeHeaderValue(req.headers["x-app-region"]),
+    country:
+      decodeHeaderValue(req.headers["x-vercel-ip-country"]) ||
+      decodeHeaderValue(req.headers["cf-ipcountry"]) ||
+      decodeHeaderValue(req.headers["x-app-country"]),
+    timezone:
+      decodeHeaderValue(req.headers["x-vercel-ip-timezone"]) ||
+      decodeHeaderValue(req.headers["cf-timezone"]) ||
+      decodeHeaderValue(req.headers["x-app-timezone"]),
+    ipHash: createHash("sha256")
+      .update(`${JWT_SECRET}:${ip}`)
+      .digest("hex"),
+    userAgent: firstHeaderValue(req.headers["user-agent"]).slice(0, 240),
+    referrer: firstHeaderValue(req.headers.referer || req.headers.referrer).slice(0, 300),
+    visitedAt: new Date(),
+  };
+}
+
+async function recordPortfolioVisit(resumeId, req) {
+  const visit = visitorInfoFromRequest(req);
+  const resume = await Resume.findOneAndUpdate(
+    {
+      _id: resumeId,
+      parseStatus: "completed",
+      parsedData: { $ne: null },
+    },
+    {
+      $inc: { portfolioTotalCount: 1 },
+      $set: { portfolioLastVisit: visit },
+      $push: {
+        portfolioVisits: {
+          $each: [visit],
+          $slice: -100,
+        },
+      },
+    },
+    { new: true },
+  ).lean();
+
+  if (!resume) {
+    return null;
+  }
+
+  await Resume.updateOne(
+    {
+      _id: resume._id,
+      portfolioVisitorKeys: { $ne: visit.ipHash },
+    },
+    {
+      $inc: { portfolioUniqueCount: 1 },
+      $addToSet: { portfolioVisitorKeys: visit.ipHash },
+    },
+  );
+
+  return Resume.findById(resume._id).lean();
+}
+
 function getUploadErrorMessage(error) {
   if (error?.status === 429 || String(error?.message || "").includes("RESOURCE_EXHAUSTED")) {
     return "Gemini quota is exhausted for the configured API key/model. Try another model or API key, then upload again.";
@@ -571,11 +723,14 @@ app.get("/api/portfolio/:resumeId", async (req, res) => {
     return res.status(400).json({ error: "Invalid resume id." });
   }
 
-  const resume = await Resume.findOne({
-    _id: req.params.resumeId,
-    parseStatus: "completed",
-    parsedData: { $ne: null },
-  }).lean();
+  const shouldTrackVisit = req.query.trackVisit === "1";
+  const resume = shouldTrackVisit
+    ? await recordPortfolioVisit(req.params.resumeId, req)
+    : await Resume.findOne({
+        _id: req.params.resumeId,
+        parseStatus: "completed",
+        parsedData: { $ne: null },
+      }).lean();
 
   if (!resume) {
     return res.status(404).json({ error: "Portfolio resume not found." });
@@ -595,6 +750,29 @@ app.get("/api/portfolio/:resumeId", async (req, res) => {
       },
       resume,
     ),
+  });
+});
+
+app.post("/api/portfolio/:resumeId/visit", async (req, res) => {
+  if (!mongoose.Types.ObjectId.isValid(req.params.resumeId)) {
+    return res.status(400).json({ error: "Invalid resume id." });
+  }
+
+  const updatedResume = await recordPortfolioVisit(req.params.resumeId, req);
+
+  if (!updatedResume) {
+    return res.status(404).json({ error: "Portfolio resume not found." });
+  }
+
+  res.json({
+    ok: true,
+    stats: {
+      totalCount: updatedResume?.portfolioTotalCount || 0,
+      uniqueCount: updatedResume?.portfolioUniqueCount || 0,
+      lastVisit: updatedResume?.portfolioLastVisit
+        ? publicVisit(updatedResume.portfolioLastVisit)
+        : null,
+    },
   });
 });
 
@@ -649,23 +827,34 @@ app.post(
       return res.status(400).json({ error: "Unsupported image category." });
     }
 
-    const folder = `${projectName}/${category}`;
-    const result = await uploadBufferToCloudinary(req.file, folder);
+    try {
+      const folder = `${projectName}/${category}`;
+      const result = await uploadBufferToCloudinary(req.file, folder);
 
-    res.status(201).json({
-      url: result.secure_url,
-      publicId: result.public_id,
-      folder,
-      category,
-      width: result.width,
-      height: result.height,
-      format: result.format,
-    });
+      res.status(201).json({
+        url: result.secure_url,
+        publicId: result.public_id,
+        folder,
+        category,
+        width: result.width,
+        height: result.height,
+        format: result.format,
+      });
+    } catch (error) {
+      res.status(502).json({
+        error: error?.message || "Image upload failed.",
+      });
+    }
   },
 );
 
 app.get("/api/resumes", requireAuth, async (req, res) => {
-  const resumes = await Resume.find({ user: req.user._id }).sort({ createdAt: -1 }).lean();
+  const resumes = await Resume.find({
+    user: req.user._id,
+    parseStatus: "completed",
+  })
+    .sort({ createdAt: -1 })
+    .lean();
   res.json({ count: resumes.length, resumes: resumes.map(publicResume) });
 });
 
@@ -727,20 +916,8 @@ app.post("/api/resumes/parse", uploadLimiter, requireAuth, upload.single("resume
     });
   } catch (error) {
     const uploadError = getUploadErrorMessage(error);
-    const savedResume = await Resume.create({
-      user: req.user._id,
-      originalFileName: req.file.originalname,
-      fileSize: req.file.size,
-      mimeType: req.file.mimetype,
-      parseStatus: "failed",
-      parseError: uploadError,
-      parsedData: null,
-    });
-
     res.status(502).json({
       error: uploadError,
-      resumeId: savedResume._id.toString(),
-      record: publicResume(savedResume),
     });
   } finally {
     fs.promises.rm(req.file.path, { force: true }).catch(() => {});
