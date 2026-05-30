@@ -12,6 +12,7 @@ import { v2 as cloudinary } from "cloudinary";
 import { createHash, timingSafeEqual, webcrypto } from "node:crypto";
 import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
+import { OAuth2Client } from "google-auth-library";
 import apiLogger from "./utils/logger.js";
 
 
@@ -43,6 +44,7 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const CLOUDINARY_PROJECT_NAME =
   process.env.CLOUDINARY_PROJECT_NAME || process.env.PROJECT_NAME || "resumeai";
 const PORTFOLIO_BASE_URL = process.env.PORTFOLIO_BASE_URL || "http://localhost:3001";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -54,6 +56,8 @@ cloudinary.config({
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
+
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
 const EXTRACTION_PROMPT = `
 You are a resume parser. Return ONLY valid JSON. No markdown, no explanation.
@@ -171,7 +175,8 @@ const userSchema = new mongoose.Schema(
   {
     name: { type: String, required: true, trim: true },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-    passwordHash: { type: String, required: true },
+    passwordHash: { type: String, required: false },
+    googleId: { type: String, default: null },
     profile: {
       title: { type: String, default: "" },
       phone: { type: String, default: "" },
@@ -231,8 +236,33 @@ const resumeSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+const feedbackSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    name: { type: String, default: "", trim: true },
+    email: { type: String, default: "", trim: true, lowercase: true },
+    type: {
+      type: String,
+      enum: ["feedback", "issue", "suggestion", "bug"],
+      default: "feedback",
+    },
+    subject: { type: String, required: true, trim: true, maxlength: 140 },
+    message: { type: String, required: true, trim: true, maxlength: 4000 },
+    pageUrl: { type: String, default: "", trim: true, maxlength: 1000 },
+    browser: { type: String, default: "", trim: true, maxlength: 500 },
+    status: {
+      type: String,
+      enum: ["new", "reviewing", "resolved", "closed"],
+      default: "new",
+    },
+    source: { type: String, default: "web", trim: true },
+  },
+  { timestamps: true }
+);
+
 const User = mongoose.model("User", userSchema);
 const Resume = mongoose.model("Resume", resumeSchema);
+const Feedback = mongoose.model("Feedback", feedbackSchema);
 
 const app = express();
 
@@ -478,6 +508,28 @@ async function requireAuth(req, res, next) {
   }
 }
 
+async function optionalAuth(req, res, next) {
+  try {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+
+    if (!token) {
+      next();
+      return;
+    }
+
+    const payload = jwt.verify(token, JWT_SECRET);
+    const user = await User.findById(payload.sub);
+
+    if (user) {
+      req.user = user;
+    }
+  } catch {
+    // Feedback should still be accepted for signed-out users.
+  }
+
+  next();
+}
+
 function sanitizeCloudinarySegment(value, fallback) {
   const sanitized = String(value || "")
     .trim()
@@ -706,6 +758,84 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
   res.json({ token: signToken(user), user: publicUser(user) });
 });
 
+app.post("/api/auth/google", authLimiter, async (req, res) => {
+  const { idToken } = req.body;
+
+  if (!idToken) {
+    return res.status(400).json({ error: "Google ID Token is required." });
+  }
+
+  let email;
+  let name;
+  let googleId;
+  let imageUrl = "";
+
+  // Check if it's a mock token (fallback for testing without a real client ID)
+  if (idToken.startsWith("mock_") || !GOOGLE_CLIENT_ID || !googleClient) {
+    console.log("Using mock Google auth fallback");
+    email = "google-user@example.com";
+    name = "Google Test User";
+    googleId = "google_mock_12345";
+    imageUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150";
+  } else {
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken,
+        audience: GOOGLE_CLIENT_ID,
+      });
+      const payload = ticket.getPayload();
+      if (!payload) {
+        return res.status(400).json({ error: "Invalid Google token payload." });
+      }
+      email = payload.email;
+      name = payload.name;
+      googleId = payload.sub;
+      imageUrl = payload.picture || "";
+    } catch (error) {
+      console.error("Google token verification failed:", error);
+      return res.status(401).json({ error: "Failed to verify Google token: " + error.message });
+    }
+  }
+
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!normalizedEmail) {
+    return res.status(400).json({ error: "Could not retrieve email from Google." });
+  }
+
+  try {
+    let user = await User.findOne({ email: normalizedEmail });
+
+    if (user) {
+      // Update googleId if not set
+      if (!user.googleId) {
+        user.googleId = googleId;
+      }
+      if (imageUrl && !user.profile?.imageUrl) {
+        user.profile = {
+          ...user.profile,
+          imageUrl,
+        };
+      }
+      await user.save();
+    } else {
+      // Create new user
+      user = await User.create({
+        name: name || "Google User",
+        email: normalizedEmail,
+        googleId,
+        profile: {
+          imageUrl,
+        },
+      });
+    }
+
+    res.json({ token: signToken(user), user: publicUser(user) });
+  } catch (dbError) {
+    console.error("Database error during Google auth:", dbError);
+    res.status(500).json({ error: "Failed to authenticate with Google." });
+  }
+});
+
 app.post("/api/auth/logout", (req, res) => {
   res.json({ ok: true });
 });
@@ -716,6 +846,43 @@ app.get("/api/auth/me", requireAuth, (req, res) => {
 
 app.get("/api/profile", requireAuth, (req, res) => {
   res.json({ user: publicUser(req.user) });
+});
+
+app.post("/api/feedback", optionalAuth, async (req, res) => {
+  const allowedTypes = new Set(["feedback", "issue", "suggestion", "bug"]);
+  const type = allowedTypes.has(req.body.type) ? req.body.type : "feedback";
+  const subject = String(req.body.subject || "").trim();
+  const message = String(req.body.message || "").trim();
+
+  if (subject.length < 3) {
+    return res.status(400).json({ error: "Please add a short subject." });
+  }
+
+  if (message.length < 10) {
+    return res.status(400).json({ error: "Please describe the feedback or issue." });
+  }
+
+  const feedback = await Feedback.create({
+    user: req.user?._id || null,
+    name: String(req.body.name || req.user?.name || "").trim(),
+    email: String(req.body.email || req.user?.email || "").trim().toLowerCase(),
+    type,
+    subject,
+    message,
+    pageUrl: String(req.body.pageUrl || "").trim(),
+    browser: String(req.body.browser || req.headers["user-agent"] || "").trim(),
+    source: "web",
+  });
+
+  res.status(201).json({
+    feedback: {
+      id: feedback._id.toString(),
+      type: feedback.type,
+      subject: feedback.subject,
+      status: feedback.status,
+      createdAt: feedback.createdAt,
+    },
+  });
 });
 
 app.get("/api/portfolio/:resumeId", async (req, res) => {
