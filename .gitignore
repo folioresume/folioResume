@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.env
+uploads/
+*.pdf
+extracted_resume.json
