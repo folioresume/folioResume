@@ -7,6 +7,7 @@ import mongoose from "mongoose";
 import cors from "cors";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import nodemailer from "nodemailer";
 import rateLimit from "express-rate-limit";
 import { v2 as cloudinary } from "cloudinary";
 import { createHash, timingSafeEqual, webcrypto } from "node:crypto";
@@ -45,6 +46,13 @@ const CLOUDINARY_PROJECT_NAME =
   process.env.CLOUDINARY_PROJECT_NAME || process.env.PROJECT_NAME || "resumeai";
 const PORTFOLIO_BASE_URL = process.env.PORTFOLIO_BASE_URL || "http://localhost:3001";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 10);
+const SMTP_HOST = process.env.SMTP_HOST || "";
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_SECURE = String(process.env.SMTP_SECURE || "false") === "true";
+const SMTP_USER = process.env.SMTP_USER || "";
+const SMTP_PASS = process.env.SMTP_PASS || "";
+const MAIL_FROM = process.env.MAIL_FROM || SMTP_USER || "FolioResume <no-reply@folioresume.com>";
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -260,9 +268,27 @@ const feedbackSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+const otpChallengeSchema = new mongoose.Schema(
+  {
+    user: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    email: { type: String, required: true, lowercase: true, trim: true },
+    purpose: {
+      type: String,
+      enum: ["registration", "password_reset"],
+      required: true,
+    },
+    otpHash: { type: String, required: true },
+    attempts: { type: Number, default: 0 },
+    consumedAt: { type: Date, default: null },
+    expiresAt: { type: Date, required: true, index: { expires: 0 } },
+  },
+  { timestamps: true }
+);
+
 const User = mongoose.model("User", userSchema);
 const Resume = mongoose.model("Resume", resumeSchema);
 const Feedback = mongoose.model("Feedback", feedbackSchema);
+const OtpChallenge = mongoose.model("OtpChallenge", otpChallengeSchema);
 
 const app = express();
 
@@ -362,6 +388,128 @@ const imageUploadLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: "Too many image uploads. Please try again later." },
 });
+
+let mailTransporter = null;
+
+function configuredMailTransporter() {
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
+    throw new Error("Email service is not configured.");
+  }
+
+  if (!mailTransporter) {
+    mailTransporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+      auth: {
+        user: SMTP_USER,
+        pass: SMTP_PASS,
+      },
+    });
+  }
+
+  return mailTransporter;
+}
+
+function generateOtp() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function hashOtp(otp) {
+  return createHash("sha256")
+    .update(String(otp))
+    .digest("hex");
+}
+
+async function sendOtpEmail({ email, name, otp, purpose }) {
+  const isPasswordReset = purpose === "password_reset";
+  const subject = isPasswordReset
+    ? "Reset your FolioResume password"
+    : "Verify your FolioResume account";
+  const intro = isPasswordReset
+    ? "Use this OTP to reset your FolioResume password."
+    : "Use this OTP to verify your email and finish creating your FolioResume account.";
+
+  await configuredMailTransporter().sendMail({
+    from: MAIL_FROM,
+    to: email,
+    subject,
+    text: `${intro}\n\nYour OTP is ${otp}.\n\nThis code expires in ${OTP_TTL_MINUTES} minutes. If you did not request this, you can ignore this email.`,
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#111827">
+        <h2 style="margin:0 0 12px;color:#3525cd">FolioResume</h2>
+        <p>Hi ${name || "there"},</p>
+        <p>${intro}</p>
+        <div style="margin:24px 0;padding:18px 20px;border-radius:12px;background:#f3f4f6;text-align:center">
+          <div style="font-size:32px;font-weight:800;letter-spacing:8px;color:#111827">${otp}</div>
+        </div>
+        <p style="font-size:14px;color:#4b5563">This code expires in ${OTP_TTL_MINUTES} minutes.</p>
+        <p style="font-size:14px;color:#4b5563">If you did not request this, you can ignore this email.</p>
+      </div>
+    `,
+  });
+}
+
+async function createOtpChallenge({ user, email, purpose }) {
+  const otp = generateOtp();
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+
+  await OtpChallenge.updateMany(
+    {
+      email: normalizedEmail,
+      purpose,
+      consumedAt: null,
+    },
+    { $set: { consumedAt: new Date() } },
+  );
+
+  const challenge = await OtpChallenge.create({
+    user: user?._id || null,
+    email: normalizedEmail,
+    purpose,
+    otpHash: hashOtp(otp),
+    expiresAt: new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000),
+  });
+
+  await sendOtpEmail({
+    email: normalizedEmail,
+    name: user?.name || "",
+    otp,
+    purpose,
+  });
+
+  return challenge;
+}
+
+async function verifyOtpChallenge({ challengeId, email, otp, purpose }) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const challenge = await OtpChallenge.findOne({
+    _id: challengeId,
+    email: normalizedEmail,
+    purpose,
+    consumedAt: null,
+  });
+
+  if (!challenge || challenge.expiresAt.getTime() < Date.now()) {
+    throw new Error("Invalid or expired OTP.");
+  }
+
+  if (challenge.attempts >= 5) {
+    throw new Error("Too many OTP attempts. Please request a new code.");
+  }
+
+  const validOtp = safeCompare(hashOtp(otp), challenge.otpHash);
+  if (!validOtp) {
+    challenge.attempts += 1;
+    await challenge.save();
+    throw new Error("Invalid OTP.");
+  }
+
+  challenge.consumedAt = new Date();
+  await challenge.save();
+
+  return challenge;
+}
 
 function requireApiKey(req, res, next) {
   if (req.path.startsWith("/portfolio/")) {
@@ -734,10 +882,63 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
     return res.status(409).json({ error: "An account with this email already exists." });
   }
 
-  const passwordHash = await bcrypt.hash(password, 12);
-  const user = await User.create({ name, email: normalizedEmail, passwordHash });
+  try {
+    const challenge = await createOtpChallenge({
+      user: null,
+      email: normalizedEmail,
+      purpose: "registration",
+    });
 
-  res.status(201).json({ token: signToken(user), user: publicUser(user) });
+    res.json({
+      challengeId: challenge._id.toString(),
+      email: normalizedEmail,
+      expiresInMinutes: OTP_TTL_MINUTES,
+      requiresOtp: true,
+    });
+  } catch (mailError) {
+    console.error("Registration OTP email failed:", mailError);
+    res.status(503).json({
+      error: "Unable to send registration OTP. Please check email configuration.",
+    });
+  }
+});
+
+app.post("/api/auth/register/verify-otp", authLimiter, async (req, res) => {
+  const { challengeId, name, email, password, otp } = req.body;
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+
+  if (!challengeId || !name || !normalizedEmail || !password || !otp) {
+    return res.status(400).json({
+      error: "Name, email, password, challenge, and OTP are required.",
+    });
+  }
+
+  if (String(password).length < 6) {
+    return res.status(400).json({ error: "Password must be at least 6 characters." });
+  }
+
+  const existingUser = await User.findOne({ email: normalizedEmail });
+  if (existingUser) {
+    return res.status(409).json({ error: "An account with this email already exists." });
+  }
+
+  try {
+    await verifyOtpChallenge({
+      challengeId,
+      email: normalizedEmail,
+      otp,
+      purpose: "registration",
+    });
+
+    const passwordHash = await bcrypt.hash(password, 12);
+    const user = await User.create({ name, email: normalizedEmail, passwordHash });
+
+    res.status(201).json({ token: signToken(user), user: publicUser(user) });
+  } catch (otpError) {
+    res.status(401).json({
+      error: otpError instanceof Error ? otpError.message : "Invalid OTP.",
+    });
+  }
 });
 
 app.post("/api/auth/login", authLimiter, async (req, res) => {
@@ -749,13 +950,92 @@ app.post("/api/auth/login", authLimiter, async (req, res) => {
   }
 
   const user = await User.findOne({ email: normalizedEmail });
-  const validPassword = user ? await bcrypt.compare(password, user.passwordHash) : false;
+  const validPassword = user?.passwordHash
+    ? await bcrypt.compare(password, user.passwordHash)
+    : false;
 
   if (!user || !validPassword) {
     return res.status(401).json({ error: "Invalid email or password." });
   }
 
   res.json({ token: signToken(user), user: publicUser(user) });
+});
+
+app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
+  const { email } = req.body;
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+
+  if (!normalizedEmail) {
+    return res.status(400).json({ error: "Email is required." });
+  }
+
+  const user = await User.findOne({ email: normalizedEmail });
+
+  if (!user || !user.passwordHash) {
+    return res.json({
+      ok: true,
+      message: "If an account exists, a password reset OTP has been sent.",
+    });
+  }
+
+  try {
+    const challenge = await createOtpChallenge({
+      user,
+      email: normalizedEmail,
+      purpose: "password_reset",
+    });
+
+    res.json({
+      challengeId: challenge._id.toString(),
+      email: normalizedEmail,
+      expiresInMinutes: OTP_TTL_MINUTES,
+      message: "Password reset OTP sent.",
+      ok: true,
+    });
+  } catch (mailError) {
+    console.error("Password reset OTP email failed:", mailError);
+    res.status(503).json({
+      error: "Unable to send password reset OTP. Please check email configuration.",
+    });
+  }
+});
+
+app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
+  const { challengeId, email, otp, password } = req.body;
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+
+  if (!challengeId || !normalizedEmail || !otp || !password) {
+    return res.status(400).json({
+      error: "Email, challenge, OTP, and new password are required.",
+    });
+  }
+
+  if (String(password).length < 6) {
+    return res.status(400).json({ error: "Password must be at least 6 characters." });
+  }
+
+  try {
+    const challenge = await verifyOtpChallenge({
+      challengeId,
+      email: normalizedEmail,
+      otp,
+      purpose: "password_reset",
+    });
+    const user = await User.findById(challenge.user);
+
+    if (!user) {
+      return res.status(401).json({ error: "User was not found." });
+    }
+
+    user.passwordHash = await bcrypt.hash(password, 12);
+    await user.save();
+
+    res.json({ token: signToken(user), user: publicUser(user) });
+  } catch (otpError) {
+    res.status(401).json({
+      error: otpError instanceof Error ? otpError.message : "Invalid OTP.",
+    });
+  }
 });
 
 app.post("/api/auth/google", authLimiter, async (req, res) => {
@@ -770,31 +1050,30 @@ app.post("/api/auth/google", authLimiter, async (req, res) => {
   let googleId;
   let imageUrl = "";
 
-  // Check if it's a mock token (fallback for testing without a real client ID)
-  if (idToken.startsWith("mock_") || !GOOGLE_CLIENT_ID || !googleClient) {
-    console.log("Using mock Google auth fallback");
-    email = "google-user@example.com";
-    name = "Google Test User";
-    googleId = "google_mock_12345";
-    imageUrl = "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&h=150";
-  } else {
-    try {
-      const ticket = await googleClient.verifyIdToken({
-        idToken,
-        audience: GOOGLE_CLIENT_ID,
-      });
-      const payload = ticket.getPayload();
-      if (!payload) {
-        return res.status(400).json({ error: "Invalid Google token payload." });
-      }
-      email = payload.email;
-      name = payload.name;
-      googleId = payload.sub;
-      imageUrl = payload.picture || "";
-    } catch (error) {
-      console.error("Google token verification failed:", error);
-      return res.status(401).json({ error: "Failed to verify Google token: " + error.message });
+  if (!GOOGLE_CLIENT_ID || !googleClient) {
+    return res.status(503).json({ error: "Google sign-in is not configured." });
+  }
+
+  if (String(idToken).startsWith("mock_")) {
+    return res.status(401).json({ error: "Invalid Google token." });
+  }
+
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    if (!payload) {
+      return res.status(400).json({ error: "Invalid Google token payload." });
     }
+    email = payload.email;
+    name = payload.name;
+    googleId = payload.sub;
+    imageUrl = payload.picture || "";
+  } catch (error) {
+    console.error("Google token verification failed:", error);
+    return res.status(401).json({ error: "Failed to verify Google token." });
   }
 
   const normalizedEmail = String(email || "").trim().toLowerCase();
@@ -806,10 +1085,11 @@ app.post("/api/auth/google", authLimiter, async (req, res) => {
     let user = await User.findOne({ email: normalizedEmail });
 
     if (user) {
-      // Update googleId if not set
       if (!user.googleId) {
         user.googleId = googleId;
       }
+
+      // Capture the Google profile photo only once. Never overwrite a user-set photo.
       if (imageUrl && !user.profile?.imageUrl) {
         user.profile = {
           ...user.profile,
@@ -818,7 +1098,6 @@ app.post("/api/auth/google", authLimiter, async (req, res) => {
       }
       await user.save();
     } else {
-      // Create new user
       user = await User.create({
         name: name || "Google User",
         email: normalizedEmail,
