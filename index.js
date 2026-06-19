@@ -29,10 +29,27 @@ dotenv.config({ path: path.join(__dirname, ".env"), quiet: true });
 
 const PORT = process.env.PORT || 4000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:3000";
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || CLIENT_ORIGIN)
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+
+function normalizeOrigin(value = "") {
+  const trimmedValue = value.trim();
+
+  if (!trimmedValue) {
+    return "";
+  }
+
+  try {
+    return new URL(trimmedValue).origin;
+  } catch {
+    return trimmedValue.replace(/\/+$/, "");
+  }
+}
+
+const ALLOWED_ORIGINS = new Set(
+  (process.env.ALLOWED_ORIGINS || CLIENT_ORIGIN)
+    .split(",")
+    .map(normalizeOrigin)
+    .filter(Boolean)
+);
 const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || "")
   .split(",")
   .map((host) => host.trim().toLowerCase())
@@ -297,7 +314,7 @@ if (process.env.NODE_ENV === "production" && JWT_SECRET === "change_this_secret_
 }
 
 function allowedOrigin(origin) {
-  return ALLOWED_ORIGINS.includes(origin);
+  return ALLOWED_ORIGINS.has(normalizeOrigin(origin));
 }
 
 function allowedHost(host = "") {
