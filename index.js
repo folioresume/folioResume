@@ -10,7 +10,8 @@ import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
 import rateLimit from "express-rate-limit";
 import { v2 as cloudinary } from "cloudinary";
-import { createHash, timingSafeEqual, webcrypto } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual, webcrypto } from "node:crypto";
+import Razorpay from "razorpay";
 import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
 import { OAuth2Client } from "google-auth-library";
@@ -63,6 +64,13 @@ const CLOUDINARY_PROJECT_NAME =
   process.env.CLOUDINARY_PROJECT_NAME || process.env.PROJECT_NAME || "resumeai";
 const PORTFOLIO_BASE_URL = process.env.PORTFOLIO_BASE_URL || "http://localhost:3001";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || "";
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "";
+const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "";
+const FREE_PARSE_LIMIT = Number(process.env.FREE_PARSE_LIMIT || 3);
+const PORTFOLIO_PRICE = Number(process.env.PORTFOLIO_PRICE || 99);
+const FOUNDING_PRICE = Number(process.env.FOUNDING_PRICE || 49);
+const FOUNDING_USER_LIMIT = Number(process.env.FOUNDING_USER_LIMIT || 100);
 const OTP_TTL_MINUTES = Number(process.env.OTP_TTL_MINUTES || 10);
 const SMTP_HOST = process.env.SMTP_HOST || "";
 const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
@@ -84,6 +92,10 @@ const ai = new GoogleGenAI({
 
 const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
+const razorpay = RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET
+  ? new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET })
+  : null;
+
 const EXTRACTION_PROMPT = `
 You are a resume parser. Return ONLY valid JSON. No markdown, no explanation.
 
@@ -100,6 +112,7 @@ Extract resume data using this schema:
     "portfolio": null,
     "imgUrl": null
   },
+  "links": [],
   "summary": null,
   "skills": [
     {
@@ -166,6 +179,7 @@ Rules:
 - Extract summary/objective if present; else null.
 - Dates: use YYYY-MM or YYYY. If only year exists, use YYYY-01.
 - imgUrl: try relevant logo/image from company/institute/linkedin context; else null.
+- links: extract ALL social/professional URLs found in the resume (LeetCode, GitHub, LinkedIn, Instagram, Twitter, CodePen, Behance, Dribbble, portfolio site, etc.) as { "label": "<platform name>", "url": "<full URL>" }. Include github and linkedin here too if present. Keep labels short and human-readable (e.g. "LeetCode", "GitHub", "LinkedIn", "Portfolio").
 - Always follow the schema exactly.
 `;
 
@@ -212,6 +226,8 @@ const userSchema = new mongoose.Schema(
       summary: { type: String, default: "" },
       competencies: { type: [String], default: [] },
     },
+    freeParseCount: { type: Number, default: 0 },
+    totalPublishedPortfolios: { type: Number, default: 0 },
   },
   { timestamps: true }
 );
@@ -219,6 +235,12 @@ const userSchema = new mongoose.Schema(
 const resumeSchema = new mongoose.Schema(
   {
     user: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null },
+    handle: {
+      type: String,
+      lowercase: true,
+      trim: true,
+      default: undefined,
+    },
     originalFileName: { type: String, required: true },
     fileSize: { type: Number, default: 0 },
     mimeType: { type: String, default: "application/pdf" },
@@ -256,6 +278,47 @@ const resumeSchema = new mongoose.Schema(
         },
       ],
       default: [],
+    },
+    status: {
+      type: String,
+      enum: ["draft", "active", "expired"],
+      default: "draft",
+    },
+    publishedAt: { type: Date, default: null },
+    expiresAt: { type: Date, default: null },
+    paymentStatus: {
+      type: String,
+      enum: ["unpaid", "paid", "failed"],
+      default: "unpaid",
+    },
+    paymentId: { type: String, default: null },
+    orderId: { type: String, default: null },
+  },
+  { timestamps: true }
+);
+
+// Partial index: only indexes documents where handle is a non-null string,
+// so multiple resumes with no handle (undefined/null) coexist without conflict.
+resumeSchema.index(
+  { handle: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { handle: { $type: "string" } },
+    name: "handle_unique_partial",
+  },
+);
+
+const paymentLogSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+    portfolioId: { type: mongoose.Schema.Types.ObjectId, ref: "Resume", required: true },
+    razorpayOrderId: { type: String, required: true, unique: true },
+    razorpayPaymentId: { type: String, default: null },
+    amount: { type: Number, required: true },
+    status: {
+      type: String,
+      enum: ["created", "paid", "failed"],
+      default: "created",
     },
   },
   { timestamps: true }
@@ -306,6 +369,7 @@ const User = mongoose.model("User", userSchema);
 const Resume = mongoose.model("Resume", resumeSchema);
 const Feedback = mongoose.model("Feedback", feedbackSchema);
 const OtpChallenge = mongoose.model("OtpChallenge", otpChallengeSchema);
+const PaymentLog = mongoose.model("PaymentLog", paymentLogSchema);
 
 const app = express();
 
@@ -372,7 +436,16 @@ app.use((req, res, next) => {
 
   next();
 });
-app.use(express.json({ limit: "2mb" }));
+app.use(
+  express.json({
+    limit: "2mb",
+    verify: (req, _res, buf) => {
+      if (req.path === "/api/payments/webhook") {
+        req.rawBody = buf;
+      }
+    },
+  }),
+);
 
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -404,6 +477,14 @@ const imageUploadLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many image uploads. Please try again later." },
+});
+
+const paymentLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.PAYMENT_RATE_LIMIT_MAX || 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many payment attempts. Please try again later." },
 });
 
 let mailTransporter = null;
@@ -529,6 +610,7 @@ async function verifyOtpChallenge({ challengeId, email, otp, purpose }) {
 }
 
 function requireApiKey(req, res, next) {
+  console.log(req)
   if (req.path.startsWith("/portfolio/")) {
     next();
     return;
@@ -565,6 +647,8 @@ function publicUser(user) {
     name: user.name,
     email: user.email,
     profile: user.profile,
+    freeParseCount: user.freeParseCount || 0,
+    totalPublishedPortfolios: user.totalPublishedPortfolios || 0,
     createdAt: user.createdAt,
   };
 }
@@ -583,11 +667,20 @@ function publicVisit(visit = {}) {
 
 function publicResume(resume) {
   const id = resume._id.toString();
-  const portfolioUrl = new URL(PORTFOLIO_BASE_URL);
-  portfolioUrl.searchParams.set("resumeId", id);
+  const handle = resume.handle || null;
+  // Clean public URL: domainname.com/username when a handle is set.
+  // Preview URL: ?resumeId=<id> when no handle yet (allows owner to preview draft).
+  const portfolioUrl = handle
+    ? `${PORTFOLIO_BASE_URL.replace(/\/+$/, "")}/${handle}`
+    : (() => {
+        const u = new URL(PORTFOLIO_BASE_URL);
+        u.searchParams.set("resumeId", id);
+        return u.toString();
+      })();
 
   return {
     id,
+    handle,
     user: resume.user?.toString?.() || null,
     originalFileName: resume.originalFileName,
     fileSize: resume.fileSize,
@@ -604,6 +697,12 @@ function publicResume(resume) {
     portfolioVisits: Array.isArray(resume.portfolioVisits)
       ? resume.portfolioVisits.map(publicVisit).reverse()
       : [],
+    status: resume.status || "draft",
+    publishedAt: resume.publishedAt || null,
+    expiresAt: resume.expiresAt || null,
+    paymentStatus: resume.paymentStatus || "unpaid",
+    paymentId: resume.paymentId || null,
+    orderId: resume.orderId || null,
     createdAt: resume.createdAt,
     updatedAt: resume.updatedAt,
   };
@@ -631,8 +730,23 @@ function publicPortfolioData(user, resume) {
       null,
   };
 
+  // Merge explicit links with social URLs from personalInfo so that existing
+  // resumes (parsed before the links field was added) still show all links.
+  const parsedLinks = Array.isArray(parsedData.links) ? parsedData.links : [];
+  const piSocialLinks = [
+    { label: "GitHub", url: parsedData.personalInfo?.github },
+    { label: "LinkedIn", url: parsedData.personalInfo?.linkedin },
+    { label: "Portfolio", url: parsedData.personalInfo?.portfolio },
+  ].filter((l) => l.url);
+  const seenLinkUrls = new Set(parsedLinks.map((l) => l.url).filter(Boolean));
+  const mergedLinks = [
+    ...parsedLinks,
+    ...piSocialLinks.filter((l) => !seenLinkUrls.has(l.url)),
+  ];
+
   return {
     personalInfo,
+    links: mergedLinks,
     summary: parsedData.summary || user.profile?.summary || null,
     skills: parsedData.skills || [
       {
@@ -795,14 +909,58 @@ function visitorInfoFromRequest(req) {
   };
 }
 
-async function recordPortfolioVisit(resumeId, req) {
+const RESERVED_HANDLES = new Set([
+  "api",
+  "portfolio",
+  "admin",
+  "login",
+  "register",
+  "dashboard",
+  "resumes",
+  "resume",
+  "settings",
+  "profile",
+  "help",
+  "templates",
+  "preview",
+  "edit",
+  "new",
+  "static",
+  "assets",
+  "favicon",
+]);
+
+const HANDLE_PATTERN = /^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])$/;
+
+function normalizeHandle(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isValidHandle(handle) {
+  return HANDLE_PATTERN.test(handle) && !RESERVED_HANDLES.has(handle);
+}
+
+// Mongoose's ObjectId.isValid() accepts any 12-char string, so use a strict
+// 24-hex check to avoid mistaking a custom handle for an ObjectId.
+function looksLikeObjectId(value) {
+  return /^[a-f0-9]{24}$/i.test(String(value || ""));
+}
+
+// Builds a Mongo filter matching a published portfolio by ObjectId or custom handle.
+function portfolioFilter(idOrHandle) {
+  const base = { parseStatus: "completed", parsedData: { $ne: null } };
+
+  if (looksLikeObjectId(idOrHandle)) {
+    return { ...base, _id: idOrHandle };
+  }
+
+  return { ...base, handle: normalizeHandle(idOrHandle) };
+}
+
+async function recordPortfolioVisit(idOrHandle, req) {
   const visit = visitorInfoFromRequest(req);
   const resume = await Resume.findOneAndUpdate(
-    {
-      _id: resumeId,
-      parseStatus: "completed",
-      parsedData: { $ne: null },
-    },
+    portfolioFilter(idOrHandle),
     {
       $inc: { portfolioTotalCount: 1 },
       $set: { portfolioLastVisit: visit },
@@ -879,6 +1037,7 @@ async function parseResumePdf(filePath) {
 }
 
 app.get("/api/health", (req, res) => {
+  // console.log(req);
   res.json({ ok: true, service: "resume-parser", model: GEMINI_MODEL });
 });
 
@@ -1181,22 +1340,91 @@ app.post("/api/feedback", optionalAuth, async (req, res) => {
   });
 });
 
+// Issues a short-lived (30 min) preview token for the owner to preview their
+// own unpublished portfolio. The portfolio app passes this back as ?preview=<token>.
+app.post("/api/portfolio/:resumeId/preview-token", requireAuth, async (req, res) => {
+  const { resumeId } = req.params;
+  if (!looksLikeObjectId(resumeId)) {
+    return res.status(400).json({ error: "Invalid resume ID." });
+  }
+  const resume = await Resume.findOne({ _id: resumeId, user: req.user._id }).lean();
+  if (!resume) {
+    return res.status(404).json({ error: "Resume not found or access denied." });
+  }
+  const token = jwt.sign(
+    { resumeId, type: "portfolio-preview" },
+    JWT_SECRET,
+    { expiresIn: "30m" },
+  );
+  res.json({ token, expiresIn: 1800 });
+});
+
 app.get("/api/portfolio/:resumeId", async (req, res) => {
-  if (!mongoose.Types.ObjectId.isValid(req.params.resumeId)) {
-    return res.status(400).json({ error: "Invalid resume id." });
+  const idOrHandle = req.params.resumeId;
+
+  if (!looksLikeObjectId(idOrHandle) && !isValidHandle(normalizeHandle(idOrHandle))) {
+    return res.status(400).json({ error: "Invalid portfolio id." });
   }
 
-  const shouldTrackVisit = req.query.trackVisit === "1";
-  const resume = shouldTrackVisit
-    ? await recordPortfolioVisit(req.params.resumeId, req)
-    : await Resume.findOne({
-        _id: req.params.resumeId,
-        parseStatus: "completed",
-        parsedData: { $ne: null },
-      }).lean();
+  const accessedByHandle = !looksLikeObjectId(idOrHandle);
+
+  // ObjectId access = owner preview mode. Require a valid signed preview token
+  // so that random guessing of MongoDB IDs cannot expose unpublished portfolios.
+  if (!accessedByHandle) {
+    const previewToken = req.query.preview;
+    if (!previewToken) {
+      return res.status(403).json({ error: "Portfolio preview requires a valid preview token." });
+    }
+    try {
+      const decoded = jwt.verify(previewToken, JWT_SECRET);
+      if (decoded.type !== "portfolio-preview" || decoded.resumeId !== idOrHandle) {
+        return res.status(403).json({ error: "Invalid preview token." });
+      }
+    } catch {
+      return res.status(403).json({ error: "Preview token has expired. Please generate a new preview link." });
+    }
+  }
+
+  // Find the resume without payment-gating so we can return meaningful errors.
+  const baseFilter = { parseStatus: "completed", parsedData: { $ne: null } };
+  const idFilter = accessedByHandle
+    ? { ...baseFilter, handle: normalizeHandle(idOrHandle) }
+    : { ...baseFilter, _id: idOrHandle };
+
+  let resume = await Resume.findOne(idFilter).lean();
 
   if (!resume) {
     return res.status(404).json({ error: "Portfolio resume not found." });
+  }
+
+  // Auto-expire portfolios whose subscription period has lapsed.
+  if (resume.status === "active" && resume.expiresAt && new Date(resume.expiresAt) < new Date()) {
+    await Resume.updateOne({ _id: resume._id }, { $set: { status: "expired" } });
+    resume = { ...resume, status: "expired" };
+  }
+
+  const portfolioStatus = resume.status || "draft";
+
+  // Handle-based (public URL): apply payment gate.
+  if (accessedByHandle) {
+    if (portfolioStatus === "expired") {
+      return res.status(402).json({
+        error: "Portfolio subscription has expired. Please renew to make it public again.",
+        status: "expired",
+      });
+    }
+    if (portfolioStatus === "draft") {
+      return res.status(402).json({
+        error: "This portfolio has not been published yet.",
+        status: "draft",
+      });
+    }
+  }
+
+  // Track visits only for public handle access, not owner previews.
+  const shouldTrackVisit = req.query.trackVisit === "1" && accessedByHandle;
+  if (shouldTrackVisit) {
+    resume = await recordPortfolioVisit(idOrHandle, req) || resume;
   }
 
   const user = resume.user ? await User.findById(resume.user).lean() : null;
@@ -1205,23 +1433,20 @@ app.get("/api/portfolio/:resumeId", async (req, res) => {
     user: user ? publicUser(user) : null,
     resume: publicResume(resume),
     data: publicPortfolioData(
-      user || {
-        _id: null,
-        name: "",
-        email: "",
-        profile: {},
-      },
+      user || { _id: null, name: "", email: "", profile: {} },
       resume,
     ),
   });
 });
 
 app.post("/api/portfolio/:resumeId/visit", async (req, res) => {
-  if (!mongoose.Types.ObjectId.isValid(req.params.resumeId)) {
-    return res.status(400).json({ error: "Invalid resume id." });
+  const idOrHandle = req.params.resumeId;
+
+  if (!looksLikeObjectId(idOrHandle) && !isValidHandle(normalizeHandle(idOrHandle))) {
+    return res.status(400).json({ error: "Invalid portfolio id." });
   }
 
-  const updatedResume = await recordPortfolioVisit(req.params.resumeId, req);
+  const updatedResume = await recordPortfolioVisit(idOrHandle, req);
 
   if (!updatedResume) {
     return res.status(404).json({ error: "Portfolio resume not found." });
@@ -1331,6 +1556,49 @@ app.get("/api/resumes/:id", requireAuth, async (req, res) => {
   res.json({ resume: publicResume(resume) });
 });
 
+app.put("/api/resumes/:id/handle", requireAuth, async (req, res) => {
+  const handle = normalizeHandle(req.body.handle);
+
+  if (!handle) {
+    return res.status(400).json({ error: "Please choose a portfolio link." });
+  }
+
+  if (!isValidHandle(handle)) {
+    return res.status(400).json({
+      error:
+        "Use 3-30 characters: lowercase letters, numbers, and hyphens (not at the start or end).",
+    });
+  }
+
+  const resume = await Resume.findOne({ _id: req.params.id, user: req.user._id });
+
+  if (!resume) {
+    return res.status(404).json({ error: "Resume not found." });
+  }
+
+  if (resume.handle === handle) {
+    return res.json({ resume: publicResume(resume) });
+  }
+
+  const existing = await Resume.findOne({ handle }).select("_id").lean();
+  if (existing && existing._id.toString() !== resume._id.toString()) {
+    return res.status(409).json({ error: "That portfolio link is already taken." });
+  }
+
+  resume.handle = handle;
+
+  try {
+    await resume.save();
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.status(409).json({ error: "That portfolio link is already taken." });
+    }
+    throw error;
+  }
+
+  res.json({ resume: publicResume(resume) });
+});
+
 app.put("/api/resumes/:id", requireAuth, async (req, res) => {
   const resume = await Resume.findOneAndUpdate(
     { _id: req.params.id, user: req.user._id },
@@ -1360,16 +1628,34 @@ app.post("/api/resumes/parse", uploadLimiter, requireAuth, upload.single("resume
     return res.status(400).json({ error: "Please choose a PDF resume before submitting." });
   }
 
+  // Enforce free parse limit for users who have never published a portfolio.
+  const user = req.user;
+  const hasPaidAccess = (user.totalPublishedPortfolios || 0) > 0;
+  if (!hasPaidAccess && (user.freeParseCount || 0) >= FREE_PARSE_LIMIT) {
+    await fs.promises.rm(req.file.path, { force: true }).catch(() => {});
+    return res.status(403).json({
+      error: `You have reached the free parse limit of ${FREE_PARSE_LIMIT} resumes. Publish a portfolio to continue.`,
+      code: "PARSE_LIMIT_REACHED",
+      freeParseLimit: FREE_PARSE_LIMIT,
+      freeParseCount: user.freeParseCount,
+    });
+  }
+
   try {
     const parsedData = await parseResumePdf(req.file.path);
     const savedResume = await Resume.create({
-      user: req.user._id,
+      user: user._id,
       originalFileName: req.file.originalname,
       fileSize: req.file.size,
       mimeType: req.file.mimetype,
       parseStatus: "completed",
       parsedData,
     });
+
+    // Increment parse count for users without a published portfolio.
+    if (!hasPaidAccess) {
+      await User.updateOne({ _id: user._id }, { $inc: { freeParseCount: 1 } });
+    }
 
     res.status(201).json({
       resumeId: savedResume._id.toString(),
@@ -1386,6 +1672,215 @@ app.post("/api/resumes/parse", uploadLimiter, requireAuth, upload.single("resume
     fs.promises.rm(req.file.path, { force: true }).catch(() => {});
   }
 });
+
+// ── Payment endpoints ──────────────────────────────────────────────────────
+
+app.post("/api/payments/create-order", paymentLimiter, requireAuth, async (req, res) => {
+  if (!razorpay) {
+    return res.status(503).json({ error: "Payment service is not configured." });
+  }
+
+  const { resumeId } = req.body;
+  if (!resumeId || !looksLikeObjectId(resumeId)) {
+    return res.status(400).json({ error: "Valid resume id is required." });
+  }
+
+  const resume = await Resume.findOne({ _id: resumeId, user: req.user._id });
+  if (!resume) {
+    return res.status(404).json({ error: "Resume not found." });
+  }
+
+  if (resume.status === "active") {
+    return res.status(400).json({ error: "This portfolio is already published." });
+  }
+
+  // Determine price: founding offer or regular price.
+  const activeCount = await Resume.countDocuments({ status: "active" });
+  const price = activeCount < FOUNDING_USER_LIMIT ? FOUNDING_PRICE : PORTFOLIO_PRICE;
+  const isFoundingOffer = activeCount < FOUNDING_USER_LIMIT;
+
+  const receipt = `rcp_${resumeId.slice(-8)}_${Date.now()}`;
+  const razorpayOrder = await razorpay.orders.create({
+    amount: price * 100,
+    currency: "INR",
+    receipt,
+    notes: { resumeId, userId: req.user._id.toString() },
+  });
+
+  // Upsert payment log for this order.
+  await PaymentLog.findOneAndUpdate(
+    { razorpayOrderId: razorpayOrder.id },
+    {
+      userId: req.user._id,
+      portfolioId: resume._id,
+      razorpayOrderId: razorpayOrder.id,
+      amount: price,
+      status: "created",
+    },
+    { upsert: true, new: true },
+  );
+
+  resume.orderId = razorpayOrder.id;
+  await resume.save();
+
+  res.json({
+    orderId: razorpayOrder.id,
+    amount: price,
+    currency: "INR",
+    razorpayKeyId: RAZORPAY_KEY_ID,
+    isFoundingOffer,
+    foundingPrice: FOUNDING_PRICE,
+    regularPrice: PORTFOLIO_PRICE,
+  });
+});
+
+app.post("/api/payments/verify", requireAuth, async (req, res) => {
+  const { razorpayOrderId, razorpayPaymentId, razorpaySignature, resumeId } = req.body;
+
+  if (!razorpayOrderId || !razorpayPaymentId || !razorpaySignature || !resumeId) {
+    return res.status(400).json({ error: "Missing required payment verification fields." });
+  }
+
+  if (!RAZORPAY_KEY_SECRET) {
+    return res.status(503).json({ error: "Payment service is not configured." });
+  }
+
+  const expectedSignature = createHmac("sha256", RAZORPAY_KEY_SECRET)
+    .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+    .digest("hex");
+
+  if (!safeCompare(razorpaySignature, expectedSignature)) {
+    return res.status(400).json({ error: "Payment signature verification failed." });
+  }
+
+  // Replay protection: reject if this payment was already processed.
+  const existingLog = await PaymentLog.findOne({ razorpayPaymentId });
+  if (existingLog && existingLog.status === "paid") {
+    return res.status(409).json({ error: "Payment already processed." });
+  }
+
+  const resume = await Resume.findOne({ _id: resumeId, user: req.user._id });
+  if (!resume) {
+    return res.status(404).json({ error: "Resume not found." });
+  }
+
+  const publishedAt = new Date();
+  const expiresAt = new Date(publishedAt.getTime() + 365 * 24 * 60 * 60 * 1000);
+
+  resume.status = "active";
+  resume.paymentStatus = "paid";
+  resume.paymentId = razorpayPaymentId;
+  resume.publishedAt = publishedAt;
+  resume.expiresAt = expiresAt;
+  await resume.save();
+
+  await PaymentLog.findOneAndUpdate(
+    { razorpayOrderId },
+    { razorpayPaymentId, status: "paid" },
+  );
+
+  await User.updateOne({ _id: req.user._id }, { $inc: { totalPublishedPortfolios: 1 } });
+
+  const portfolioUrl = publicResume(resume).portfolioUrl;
+
+  res.json({
+    success: true,
+    portfolioUrl,
+    expiresAt: expiresAt.toISOString(),
+    publishedAt: publishedAt.toISOString(),
+  });
+});
+
+app.post("/api/payments/webhook", async (req, res) => {
+  const signature = req.headers["x-razorpay-signature"];
+
+  if (!RAZORPAY_WEBHOOK_SECRET) {
+    return res.status(200).json({ ok: true });
+  }
+
+  if (!req.rawBody) {
+    return res.status(400).json({ error: "Raw body not available." });
+  }
+
+  const expectedSig = createHmac("sha256", RAZORPAY_WEBHOOK_SECRET)
+    .update(req.rawBody)
+    .digest("hex");
+
+  if (!safeCompare(signature || "", expectedSig)) {
+    return res.status(400).json({ error: "Invalid webhook signature." });
+  }
+
+  let event;
+  try {
+    event = JSON.parse(req.rawBody.toString());
+  } catch {
+    return res.status(400).json({ error: "Invalid webhook payload." });
+  }
+
+  if (event.event === "payment.captured") {
+    const payment = event.payload?.payment?.entity;
+    if (payment?.order_id) {
+      const log = await PaymentLog.findOne({ razorpayOrderId: payment.order_id });
+      if (log && log.status !== "paid") {
+        log.razorpayPaymentId = payment.id;
+        log.status = "paid";
+        await log.save();
+
+        const portfolioResume = await Resume.findById(log.portfolioId);
+        if (portfolioResume && portfolioResume.status !== "active") {
+          const publishedAt = new Date();
+          portfolioResume.status = "active";
+          portfolioResume.paymentStatus = "paid";
+          portfolioResume.paymentId = payment.id;
+          portfolioResume.publishedAt = publishedAt;
+          portfolioResume.expiresAt = new Date(publishedAt.getTime() + 365 * 24 * 60 * 60 * 1000);
+          await portfolioResume.save();
+          await User.updateOne({ _id: log.userId }, { $inc: { totalPublishedPortfolios: 1 } });
+        }
+      }
+    }
+  } else if (event.event === "payment.failed") {
+    const payment = event.payload?.payment?.entity;
+    if (payment?.order_id) {
+      await PaymentLog.findOneAndUpdate(
+        { razorpayOrderId: payment.order_id },
+        { razorpayPaymentId: payment.id, status: "failed" },
+      );
+      const log = await PaymentLog.findOne({ razorpayOrderId: payment.order_id });
+      if (log) {
+        await Resume.findByIdAndUpdate(log.portfolioId, { paymentStatus: "failed" });
+      }
+    }
+  }
+
+  res.json({ ok: true });
+});
+
+app.get("/api/payments/history", requireAuth, async (req, res) => {
+  const payments = await PaymentLog.find({ userId: req.user._id })
+    .sort({ createdAt: -1 })
+    .populate("portfolioId", "originalFileName handle parsedData")
+    .lean();
+
+  res.json({
+    payments: payments.map((p) => ({
+      id: p._id.toString(),
+      portfolioId: p.portfolioId?._id?.toString() || null,
+      portfolioName:
+        p.portfolioId?.parsedData?.personalInfo?.name ||
+        p.portfolioId?.originalFileName ||
+        "Unknown",
+      portfolioHandle: p.portfolioId?.handle || null,
+      razorpayOrderId: p.razorpayOrderId,
+      razorpayPaymentId: p.razorpayPaymentId || null,
+      amount: p.amount,
+      status: p.status,
+      createdAt: p.createdAt,
+    })),
+  });
+});
+
+// ── End payment endpoints ──────────────────────────────────────────────────
 
 app.use((error, req, res, next) => {
   if (error.message === "Origin is not allowed by CORS.") {
@@ -1408,11 +1903,51 @@ app.use((error, req, res, next) => {
   res.status(500).json({ error: "Unexpected backend error." });
 });
 
+async function runMigrations() {
+  const resumeCollection = mongoose.connection.db.collection("resumes");
+
+  // Fix handle uniqueness: MongoDB sparse indexes still index null values, so
+  // multiple resumes with handle=null trigger a duplicate-key error. We replace
+  // the old sparse unique index with a partial index that only covers real strings.
+  try {
+    const existingIndexes = await resumeCollection.indexes();
+    const oldIndex = existingIndexes.find((idx) => idx.name === "handle_1");
+    if (oldIndex) {
+      await resumeCollection.dropIndex("handle_1");
+      console.log("Migration: dropped legacy handle_1 index.");
+    }
+    // Unset explicitly-stored null handles so the partial index ignores them.
+    const unsetResult = await resumeCollection.updateMany(
+      { handle: null },
+      { $unset: { handle: "" } },
+    );
+    if (unsetResult.modifiedCount > 0) {
+      console.log(`Migration: cleared null handle from ${unsetResult.modifiedCount} resume(s).`);
+    }
+  } catch (err) {
+    console.warn("Migration: handle index cleanup warning:", err.message);
+  }
+
+  // Ensure the new partial index exists.
+  await Resume.createIndexes();
+
+  // Mark all pre-monetisation resumes as active so existing portfolios stay accessible.
+  const result = await Resume.updateMany(
+    { status: { $exists: false }, parseStatus: "completed", parsedData: { $ne: null } },
+    { $set: { status: "active", paymentStatus: "paid" } },
+  );
+  if (result.modifiedCount > 0) {
+    console.log(`Migration: activated ${result.modifiedCount} pre-existing portfolio(s).`);
+  }
+}
+
 async function startServer() {
   await mongoose.connect(MONGODB_URI, {
     serverSelectionTimeoutMS: 5000,
   });
   console.log("Connected to MongoDB");
+
+  await runMigrations();
 
   app.listen(PORT, () => {
     console.log(`Resume parser API running at http://localhost:${PORT}`);
