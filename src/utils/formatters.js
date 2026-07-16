@@ -46,6 +46,7 @@ export function publicResume(resume) {
     parseStatus: resume.parseStatus,
     parseError: resume.parseError,
     parsedData: resume.parsedData,
+    theme: resume.theme === "light" ? "light" : "dark",
     portfolioTotalCount: resume.portfolioTotalCount || 0,
     portfolioUniqueCount: resume.portfolioUniqueCount || 0,
     portfolioUrl: portfolioUrl.toString(),
@@ -107,6 +108,7 @@ export function publicPortfolioData(user, resume) {
 
   return {
     personalInfo,
+    theme: resume?.theme === "light" ? "light" : "dark",
     links: mergedLinks,
     summary: parsedData.summary || user.profile?.summary || null,
     skills: parsedData.skills || [

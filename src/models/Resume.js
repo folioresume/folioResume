@@ -21,6 +21,7 @@ const resumeSchema = new mongoose.Schema(
     parseStatus: { type: String, enum: ["completed", "failed"], default: "completed" },
     parseError: { type: String, default: null },
     parsedData: { type: mongoose.Schema.Types.Mixed, default: null },
+    theme: { type: String, enum: ["dark", "light"], default: "dark" },
     portfolioTotalCount: { type: Number, default: 0 },
     portfolioUniqueCount: { type: Number, default: 0 },
     portfolioVisitorKeys: { type: [String], default: [] },

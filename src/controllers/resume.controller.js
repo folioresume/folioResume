@@ -71,9 +71,13 @@ export async function parseResume(req, res) {
 }
 
 export async function updateResume(req, res) {
+  const update = { parseStatus: "completed", parseError: null };
+  if (req.body.parsedData !== undefined) update.parsedData = req.body.parsedData;
+  if (req.body.theme === "dark" || req.body.theme === "light") update.theme = req.body.theme;
+
   const resume = await Resume.findOneAndUpdate(
     { _id: req.params.id, user: req.user._id },
-    { parsedData: req.body.parsedData, parseStatus: "completed", parseError: null },
+    update,
     { new: true },
   );
   if (!resume) return res.status(404).json({ error: "Resume not found." });
